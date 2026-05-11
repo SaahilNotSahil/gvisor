@@ -20,6 +20,8 @@ import (
 	_ "embed"
 	"fmt"
 	"hash/fnv"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -82,6 +84,44 @@ func (l *tbLogger) Logf(format string, args ...any) {
 
 func (l *tbLogger) Name() string {
 	return l.tb.Name()
+}
+
+func recordModelLoadTimes(ctx context.Context, t *testing.T, logs string) {
+	recorder, err := benchmetric.GetRecorder(ctx)
+	if err != nil {
+		t.Fatalf("Failed to initialize benchmark recorder: %v", err)
+	}
+	// Example logs:
+	// INFO 05-08 00:15:10 [default_loader.py:308] Loading weights took 1.72 seconds
+	// INFO 05-08 00:15:20 [tpu_runner.py:536] Init model | hbm=[(2.88, 15.75)]GiB
+	// Loading Weights into Host Memory: Took 1.72 seconds.
+	// Initializing Model on the TPU (HBM Allocations): Took 10 seconds.
+	weightRe := regexp.MustCompile(`INFO\s+(\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*Loading weights took ([0-9.]+) seconds`)
+	initRe := regexp.MustCompile(`INFO\s+(\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*Init model`)
+
+	if m1 := weightRe.FindStringSubmatch(logs); len(m1) > 0 {
+		if weightSeconds, err := strconv.ParseFloat(m1[2], 64); err == nil {
+			weightTime := time.Duration(weightSeconds * float64(time.Second))
+			if err := recorder.Record(ctx, "vLLM/ModelLoad", benchmetric.SpecificDuration(weightTime, "load-weights")); err != nil {
+				t.Fatalf("Failed to record benchmark data: %v", err)
+			}
+			t.Logf("Model Load Weights: %v", weightTime)
+		}
+
+		if weightTimeParsed, err := time.Parse("01-02 15:04:05", m1[1]); err == nil {
+			if m2 := initRe.FindStringSubmatch(logs); len(m2) > 0 {
+				if initTimeParsed, err := time.Parse("01-02 15:04:05", m2[1]); err == nil {
+					hbmTime := initTimeParsed.Sub(weightTimeParsed)
+					if err := recorder.Record(ctx, "vLLM/ModelLoad", benchmetric.SpecificDuration(hbmTime, "init-hbm")); err != nil {
+						t.Fatalf("Failed to record benchmark data: %v", err)
+					}
+					t.Logf("Model Init HBM: %v", hbmTime)
+				}
+			}
+		}
+	} else {
+		t.Logf("Could not parse model load times from logs.")
+	}
 }
 
 // BenchmarkVLLM runs vllm benchmarks for a single cluster.
@@ -161,6 +201,12 @@ func BenchmarkVLLM(ctx context.Context, t *testing.T, k8sCtx k8sctx.KubernetesCo
 		t.Fatalf("Failed to create vllm client against server pod: %v", err)
 	}
 	logWithTime(t, "vllm server ready.")
+	// Log the model load times.
+	logs, err := vllmServer.Logs(ctx)
+	if err != nil {
+		t.Fatalf("could not get logs: %v", err)
+	}
+	recordModelLoadTimes(ctx, t, logs)
 
 	type testCase struct {
 		name           string
