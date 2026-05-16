@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <fcntl.h>
+#include <grp.h>
 #include <sched.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -308,6 +309,128 @@ TEST_P(ProcPidUidGidMapTest, MapAnyIDsPrivileged) {
 INSTANTIATE_TEST_SUITE_P(All, ProcPidUidGidMapTest,
                          ::testing::ValuesIn(UidGidMapTestParams()),
                          DescribeTestParam);
+
+TEST(ProcSelfSetgroupsTest, ExistsAndAllowsByDefault) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanCreateUserNamespace()));
+  EXPECT_THAT(InNewUserNamespace([] {
+                int fd = open("/proc/self/setgroups", O_RDONLY);
+                TEST_PCHECK(fd >= 0);
+                char buf[16] = {};
+                ssize_t n = read(fd, buf, sizeof(buf) - 1);
+                TEST_PCHECK(n > 0);
+                TEST_CHECK(std::string(buf, n) == "allow\n");
+                TEST_PCHECK(close(fd) == 0);
+              }),
+              IsPosixErrorOkAndHolds(0));
+}
+
+TEST(ProcSelfSetgroupsTest, DenyTogglesReadback) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanCreateUserNamespace()));
+  EXPECT_THAT(InNewUserNamespace([] {
+                int wfd = open("/proc/self/setgroups", O_WRONLY);
+                TEST_PCHECK(wfd >= 0);
+                TEST_PCHECK(write(wfd, "deny", 4) == 4);
+                TEST_PCHECK(close(wfd) == 0);
+                int rfd = open("/proc/self/setgroups", O_RDONLY);
+                TEST_PCHECK(rfd >= 0);
+                char buf[16] = {};
+                ssize_t n = read(rfd, buf, sizeof(buf) - 1);
+                TEST_PCHECK(n > 0);
+                TEST_CHECK(std::string(buf, n) == "deny\n");
+                TEST_PCHECK(close(rfd) == 0);
+              }),
+              IsPosixErrorOkAndHolds(0));
+}
+
+TEST(ProcSelfSetgroupsTest, AllowAfterDenyFails) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanCreateUserNamespace()));
+  // Linux only accepts writes at offset 0, so re-test with a fresh fd.
+  EXPECT_THAT(InNewUserNamespace([] {
+                int fd = open("/proc/self/setgroups", O_WRONLY);
+                TEST_PCHECK(fd >= 0);
+                TEST_PCHECK(write(fd, "deny", 4) == 4);
+                TEST_PCHECK(close(fd) == 0);
+                fd = open("/proc/self/setgroups", O_WRONLY);
+                TEST_PCHECK(fd >= 0);
+                TEST_PCHECK(write(fd, "allow", 5) < 0);
+                TEST_CHECK(errno == EPERM);
+                TEST_PCHECK(close(fd) == 0);
+              }),
+              IsPosixErrorOkAndHolds(0));
+}
+
+TEST(ProcSelfSetgroupsTest, BadValueReturnsEINVAL) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanCreateUserNamespace()));
+  EXPECT_THAT(InNewUserNamespace([] {
+                int fd = open("/proc/self/setgroups", O_WRONLY);
+                TEST_PCHECK(fd >= 0);
+                TEST_PCHECK(write(fd, "maybe", 5) < 0);
+                TEST_CHECK(errno == EINVAL);
+                TEST_PCHECK(close(fd) == 0);
+              }),
+              IsPosixErrorOkAndHolds(0));
+}
+
+TEST(ProcSelfSetgroupsTest, SetgroupsSyscallFailsAfterDeny) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanCreateUserNamespace()));
+  EXPECT_THAT(InNewUserNamespace([] {
+                DenySelfSetgroups();
+                TEST_PCHECK(setgroups(0, nullptr) < 0);
+                TEST_CHECK(errno == EPERM);
+                gid_t one_gid = 0;
+                TEST_PCHECK(setgroups(1, &one_gid) < 0);
+                TEST_CHECK(errno == EPERM);
+              }),
+              IsPosixErrorOkAndHolds(0));
+}
+
+TEST(ProcSelfSetgroupsTest, SetgroupsSyscallFailsBeforeGidMap) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanCreateUserNamespace()));
+  EXPECT_THAT(InNewUserNamespace([] {
+                TEST_PCHECK(setgroups(0, nullptr) < 0);
+                TEST_CHECK(errno == EPERM);
+                gid_t one_gid = 0;
+                TEST_PCHECK(setgroups(1, &one_gid) < 0);
+                TEST_CHECK(errno == EPERM);
+              }),
+              IsPosixErrorOkAndHolds(0));
+}
+
+TEST(ProcSelfSetgroupsTest, ChildUserNamespaceInheritsDeny) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanCreateUserNamespace()));
+  EXPECT_THAT(InNewUserNamespace([] {
+                int wfd = open("/proc/self/setgroups", O_WRONLY);
+                TEST_PCHECK(wfd >= 0);
+                TEST_PCHECK(write(wfd, "deny", 4) == 4);
+                TEST_PCHECK(close(wfd) == 0);
+                TEST_PCHECK(unshare(CLONE_NEWUSER) == 0);
+                int rfd = open("/proc/self/setgroups", O_RDONLY);
+                TEST_PCHECK(rfd >= 0);
+                char buf[16] = {};
+                ssize_t n = read(rfd, buf, sizeof(buf) - 1);
+                TEST_PCHECK(n > 0);
+                TEST_CHECK(std::string(buf, n) == "deny\n");
+                TEST_PCHECK(close(rfd) == 0);
+              }),
+              IsPosixErrorOkAndHolds(0));
+}
+
+TEST(ProcSelfSetgroupsTest, DenyAfterGidMapFails) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanCreateUserNamespace()));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETGID)));
+  pid_t child_pid;
+  Cleanup cleanup_child;
+  std::tie(child_pid, cleanup_child) =
+      ASSERT_NO_ERRNO_AND_VALUE(CreateProcessInNewUserNamespace());
+  std::string line = absl::StrCat(getgid(), " ", getgid(), " 1");
+  auto map_fd = ASSERT_NO_ERRNO_AND_VALUE(
+      Open(absl::StrCat("/proc/", child_pid, "/gid_map"), O_RDWR));
+  ASSERT_THAT(write(map_fd.get(), line.c_str(), line.size()),
+              SyscallSucceedsWithValue(line.size()));
+  auto sg_fd = ASSERT_NO_ERRNO_AND_VALUE(
+      Open(absl::StrCat("/proc/", child_pid, "/setgroups"), O_WRONLY));
+  EXPECT_THAT(write(sg_fd.get(), "deny", 4), SyscallFailsWithErrno(EPERM));
+}
 
 }  // namespace testing
 }  // namespace gvisor
